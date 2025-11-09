@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime as dt
 import json
 import os
 import struct
-from typing import Any
+from typing import Any, TypedDict
 
 from playwright.async_api import async_playwright
 
@@ -16,6 +17,11 @@ try:  # optional helper
     import blackboxprotobuf  # type: ignore
 except Exception:  # pragma: no cover
     blackboxprotobuf = None
+
+try:  # optional dependency for Mongo persistence
+    from motor.motor_asyncio import AsyncIOMotorClient  # type: ignore
+except Exception:  # pragma: no cover
+    AsyncIOMotorClient = None
 
 URL = "https://whop.com/pulse/"
 
@@ -82,6 +88,100 @@ MARKETPLACE_BASE_URL = "https://whop.com/marketplace/"
 SHOW_RAW_PAYLOAD = bool(os.environ.get("PULSE_SHOW_RAW"))
 
 
+class PulseSummary(TypedDict, total=False):
+    entries: list[dict[str, object]]
+    context: dict[str, object]
+
+
+class PulseMongoSink:
+    """Persist decoded websocket payloads into MongoDB and track stream status."""
+
+    def __init__(
+        self,
+        client: AsyncIOMotorClient,
+        data_collection,
+        status_collection,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self._client = client
+        self._data_collection = data_collection
+        self._status_collection = status_collection
+        self._loop = loop
+        self._confirmed = asyncio.Event()
+
+    @classmethod
+    async def connect(cls) -> PulseMongoSink | None:
+        uri = os.environ.get("PULSE_MONGO_URI")
+        if not uri:
+            return None
+        if AsyncIOMotorClient is None:
+            raise RuntimeError("motor is required for MongoDB persistence but is not installed.")
+        db_name = os.environ.get("PULSE_MONGO_DB") or "default"
+        data_collection_name = os.environ.get("PULSE_MONGO_COLLECTION") or "pulse_stream"
+        status_collection_name = os.environ.get("PULSE_MONGO_STATUS_COLLECTION") or f"{data_collection_name}_status"
+
+        loop = asyncio.get_running_loop()
+        client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
+        await client.admin.command("ping")
+        database = client[db_name]
+        data_collection = database[data_collection_name]
+        status_collection = database[status_collection_name]
+        return cls(client, data_collection, status_collection, loop)
+
+    def submit(self, summary: PulseSummary | None) -> None:
+        if not summary:
+            return
+        entries = summary.get("entries") or []
+        if not entries:
+            return
+        if self._loop.is_closed():
+            return
+        context = summary.get("context") or {}
+        self._loop.create_task(self._persist(entries, context))
+
+    async def _persist(self, entries: list[dict[str, object]], context: dict[str, object]) -> None:
+        try:
+            timestamp = dt.datetime.now(dt.timezone.utc)
+            documents = [
+                {
+                    "type": "pulse_listing",
+                    "received_at": timestamp,
+                    "entry": entry,
+                    "context": context,
+                }
+                for entry in entries
+            ]
+            result = await self._data_collection.insert_many(documents, ordered=False)
+            await self._status_collection.update_one(
+                {"_id": "pulse_stream"},
+                {
+                    "$set": {
+                        "confirmed": True,
+                        "last_received_at": timestamp,
+                        "last_batch_size": len(documents),
+                    },
+                    "$inc": {"batches": 1, "documents": len(documents)},
+                },
+                upsert=True,
+            )
+            if result.inserted_ids:
+                self._confirmed.set()
+        except Exception as exc:  # pragma: no cover - surface via loop handler
+            self._loop.call_exception_handler(
+                {"message": "Mongo persistence failed", "exception": exc}
+            )
+
+    async def wait_until_confirmed(self, timeout: float | None = None) -> bool:
+        try:
+            await asyncio.wait_for(self._confirmed.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def close(self) -> None:
+        self._client.close()
+
+
 _FETCHED_LISTING_URLS: set[str] = set()
 _FETCHING_LISTING_URLS: set[str] = set()
 
@@ -144,20 +244,21 @@ def _collect_priced_products(obj) -> list[dict[str, object]]:
     return results
 
 
-def _print_priced_products_summary(obj) -> list[dict[str, object]]:
+def _summarize_priced_products(obj) -> PulseSummary | None:
     entries = _collect_priced_products(obj)
-    printable: dict[str, object] = {}
+    context: dict[str, object] = {}
     if isinstance(obj, dict):
         for key in ("query", "purchase"):
             if key in obj:
-                printable[key] = obj[key]
-    if not entries and not printable:
-        return
-    if printable:
-        print(json.dumps(printable, indent=2, default=_json_fallback))
-    for entry in entries:
-        print(json.dumps(entry, indent=2, default=_json_fallback))
-    return entries
+                context[key] = obj[key]
+    if not entries and not context:
+        return None
+    summary: PulseSummary = {}
+    if entries:
+        summary["entries"] = entries
+    if context:
+        summary["context"] = context
+    return summary
 
 
 def _fixed64_int_to_double(value: int) -> float:
@@ -207,7 +308,7 @@ def recursive_decode(data: bytes, prefix: tuple[str, ...] = ()) -> object:
     }
 
 
-def decode_whop_protobuf(base64_data: str) -> list[dict[str, object]] | None:
+def decode_whop_protobuf(base64_data: str) -> PulseSummary | None:
     """Decode base64 protobuf blobs printed by the WS hook, handling mixed payloads."""
 
     if blackboxprotobuf is None:
@@ -227,7 +328,7 @@ def decode_whop_protobuf(base64_data: str) -> list[dict[str, object]] | None:
             else:
                 print(decoded)
             print("------------------------\n")
-        return _print_priced_products_summary(decoded)
+        return _summarize_priced_products(decoded)
     except Exception as exc:
         print(f"[!] Protobuf decode error: {exc}")
     return None
@@ -306,6 +407,12 @@ async def run(url: str = URL, headless: bool | None = None) -> None:
         page = await browser.new_page()
         await page.add_init_script(WS_HOOK)
 
+        mongo_sink = None
+        try:
+            mongo_sink = await PulseMongoSink.connect()
+        except Exception as exc:  # pragma: no cover - configuration errors bubble
+            raise RuntimeError("Failed to initialize Mongo sink") from exc
+
         def _handle_console(msg) -> None:
             text = msg.text
             if "[WS-HOOK]" not in text:
@@ -313,15 +420,19 @@ async def run(url: str = URL, headless: bool | None = None) -> None:
             marker = "[WS-HOOK] BINARY payload:"
             if marker in text:
                 b64 = text.split(marker, 1)[1].strip()
-                entries = decode_whop_protobuf(b64)
-                if entries:
-                    for entry in entries:
-                        price = entry.get("price")
-                        url = entry.get("url")
-                        if price is None:
-                            continue
-                        if isinstance(url, str):
-                            _schedule_listing_snapshot_fetch(url)
+                summary = decode_whop_protobuf(b64)
+                if summary:
+                    entries = summary.get("entries") or []
+                    if entries:
+                        for entry in entries:
+                            price = entry.get("price")
+                            url = entry.get("url")
+                            if price is None:
+                                continue
+                            if isinstance(url, str):
+                                _schedule_listing_snapshot_fetch(url)
+                    if mongo_sink:
+                        mongo_sink.submit(summary)
                 return
             # print(f"BROWSER: {text}")
 
@@ -342,6 +453,8 @@ async def run(url: str = URL, headless: bool | None = None) -> None:
                 pass
             await page.close()
             await browser.close()
+            if mongo_sink:
+                mongo_sink.close()
 
 
 if __name__ == "__main__":
