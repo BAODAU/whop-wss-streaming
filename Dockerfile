@@ -1,4 +1,12 @@
-#... existing setup ...
+FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy AS base
+
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+
+PYTHONUNBUFFERED=1 \
+
+PULSE_PLAYWRIGHT_HEADLESS=1
+
 
 WORKDIR /app
 
