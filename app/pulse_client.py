@@ -88,6 +88,20 @@ MARKETPLACE_BASE_URL = "https://whop.com/marketplace/"
 SHOW_RAW_PAYLOAD = bool(os.environ.get("PULSE_SHOW_RAW"))
 
 
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _log_mongo_documents(documents: list[dict[str, object]], note: str) -> None:
+    if not documents:
+        return
+    print(f"[MONGO] {note}")
+    print(json.dumps(documents, indent=2, default=_json_fallback))
+
+
 class PulseSummary(TypedDict, total=False):
     entries: list[dict[str, object]]
     context: dict[str, object]
@@ -108,6 +122,22 @@ class PulseMongoSink:
         self._status_collection = status_collection
         self._loop = loop
         self._confirmed = asyncio.Event()
+
+    @staticmethod
+    def prepare_documents(
+        entries: list[dict[str, object]], context: dict[str, object]
+    ) -> tuple[dt.datetime, list[dict[str, object]]]:
+        timestamp = dt.datetime.now(dt.timezone.utc)
+        documents = [
+            {
+                "type": "pulse_listing",
+                "received_at": timestamp,
+                "entry": entry,
+                "context": context,
+            }
+            for entry in entries
+        ]
+        return timestamp, documents
 
     @classmethod
     async def connect(cls) -> PulseMongoSink | None:
@@ -137,20 +167,14 @@ class PulseMongoSink:
         if self._loop.is_closed():
             return
         context = summary.get("context") or {}
-        self._loop.create_task(self._persist(entries, context))
+        timestamp, documents = self.prepare_documents(entries, context)
+        _log_mongo_documents(documents, "Streaming documents")
+        self._loop.create_task(self._persist(timestamp, documents))
 
-    async def _persist(self, entries: list[dict[str, object]], context: dict[str, object]) -> None:
+    async def _persist(
+        self, timestamp: dt.datetime, documents: list[dict[str, object]]
+    ) -> None:
         try:
-            timestamp = dt.datetime.now(dt.timezone.utc)
-            documents = [
-                {
-                    "type": "pulse_listing",
-                    "received_at": timestamp,
-                    "entry": entry,
-                    "context": context,
-                }
-                for entry in entries
-            ]
             result = await self._data_collection.insert_many(documents, ordered=False)
             await self._status_collection.update_one(
                 {"_id": "pulse_stream"},
@@ -408,10 +432,16 @@ async def run(url: str = URL, headless: bool | None = None) -> None:
         await page.add_init_script(WS_HOOK)
 
         mongo_sink = None
-        try:
-            mongo_sink = await PulseMongoSink.connect()
-        except Exception as exc:  # pragma: no cover - configuration errors bubble
-            raise RuntimeError("Failed to initialize Mongo sink") from exc
+        if _env_flag("PULSE_DISABLE_MONGO"):
+            print("[MONGO] Disabled via PULSE_DISABLE_MONGO; logging only.")
+        else:
+            try:
+                mongo_sink = await PulseMongoSink.connect()
+                if mongo_sink is None:
+                    print("[MONGO] No URI configured; logging only.")
+            except Exception as exc:  # pragma: no cover - configuration errors bubble
+                print(f"[MONGO] Disabled (connection failed): {exc}")
+                mongo_sink = None
 
         def _handle_console(msg) -> None:
             text = msg.text
@@ -423,6 +453,7 @@ async def run(url: str = URL, headless: bool | None = None) -> None:
                 summary = decode_whop_protobuf(b64)
                 if summary:
                     entries = summary.get("entries") or []
+                    context = summary.get("context") or {}
                     if entries:
                         for entry in entries:
                             price = entry.get("price")
@@ -433,6 +464,9 @@ async def run(url: str = URL, headless: bool | None = None) -> None:
                                 _schedule_listing_snapshot_fetch(url)
                     if mongo_sink:
                         mongo_sink.submit(summary)
+                    elif entries:
+                        _, documents = PulseMongoSink.prepare_documents(entries, context)
+                        _log_mongo_documents(documents, "Logging only (Mongo disabled)")
                 return
             # print(f"BROWSER: {text}")
 
