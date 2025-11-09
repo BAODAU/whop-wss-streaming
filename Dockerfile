@@ -1,15 +1,17 @@
-FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy AS base
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PULSE_PLAYWRIGHT_HEADLESS=1
+#... existing setup ...
 
 WORKDIR /app
 
 RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock ./
-RUN uv pip sync uv.lock \
+
+# 1. Add the future .venv to PATH immediately
+ENV PATH="/app/.venv/bin:$PATH"
+
+# 2. Use 'uv sync --frozen' to install directly from uv.lock
+# 3. Run playwright install (now correctly located in .venv)
+RUN uv sync --frozen \
     && playwright install --with-deps chromium
 
 COPY app ./app
